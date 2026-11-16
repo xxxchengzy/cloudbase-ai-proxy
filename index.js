@@ -88,7 +88,7 @@ server.post('/v1/chat/completions', async (req, res) => {
     if (hasTools || !stream) {
       const out = await mdl.generateText(params);
       const { msg, finish } = mapRaw(out);
-      let tcs = toOAIToolCalls(msg.tool_calls);
+      let tcs = toOAI(msg.tool_calls);
       let content = msg.content || out.text || '';
       if (!tcs.length) {
         const r = repairLeakedToolCalls(content);
