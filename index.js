@@ -7,13 +7,14 @@ const app = tcb.init({
   secretKey: process.env.TCB_SECRET_KEY || undefined,
   timeout: 900000
 });
+const VERSION = 'repair-3ded227';
 const MODELS = ['hy4', 'hy3', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017'];
 
 const server = express();
 server.use(express.json({ limit: '8mb' }));
 
 server.get('/v1/models', (_req, res) => {
-  res.json({ object: 'list', data: MODELS.map(m => ({ id: m, object: 'model', owned_by: 'cloudbase' })) });
+  res.json({ version: VERSION, object: 'list', data: MODELS.map(m => ({ id: m, object: 'model', owned_by: 'cloudbase' })) });
 });
 
 function mapRaw(out) {
