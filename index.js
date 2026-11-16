@@ -7,7 +7,7 @@ const app = tcb.init({
   secretKey: process.env.TCB_SECRET_KEY || undefined,
   timeout: 900000
 });
-const VERSION = 'repair-3ded227';
+const VERSION = 'fix-3f582e0';
 const MODELS = ['hy4', 'hy3', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017'];
 
 const server = express();
