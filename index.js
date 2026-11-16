@@ -64,4 +64,23 @@ server.post('/v1/images/generations', async (req, res) => {
   }
 });
 
+server.get('/v1/tooltest', async (_req, res) => {
+  const mdl = app.ai().createModel('cloudbase');
+  const msgs = [{ role: 'user', content: '请调用 get_test 工具' }];
+  const out = {};
+  try {
+    out.openaiFormat = await mdl.generateText({
+      model: 'hy4', messages: msgs,
+      tools: [{ type: 'function', function: { name: 'get_test', description: '测试工具', parameters: { type: 'object', properties: {} } } }]
+    });
+  } catch (e) { out.openaiFormat = { error: String(e && e.message || e) }; }
+  try {
+    out.fnNoFn = await mdl.generateText({
+      model: 'hy4', messages: msgs,
+      tools: [{ name: 'get_test', description: '测试工具', parameters: { type: 'object', properties: {} } }]
+    });
+  } catch (e) { out.fnNoFn = { error: String(e && e.message || e) }; }
+  return res.json(out);
+});
+
 server.listen(process.env.PORT || 80, '0.0.0.0');
