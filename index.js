@@ -24,15 +24,49 @@ function mapRaw(out) {
   return { msg, finish: (raw && raw.finish_reason) || null };
 }
 
-function toOpenAIToolCalls(tcs) {
-  return (tcs || []).map((tc, i) => ({
-    id: tc.id || ('call_' + i + '_' + Date.now()),
+// 修复层：解析模型泄露在正文里的工具调用标记（混元/GLM arg_key 风格、通用 invoke 风格）
+function repairLeakedToolCalls(content) {
+  if (!content || typeof content !== 'string' || content.indexOf('<') === -1) return { tcs: null, content };
+  const tcs = [];
+  let cleaned = content;
+  let m;
+  // 风格1: <tool_calls:ID><tool_call:ID>tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call></tool_calls>
+  const blockRe = /<tool_calls:[^>]*>([\s\S]*?)<\/tool_calls>/g;
+  while ((m = blockRe.exec(content)) !== null) {
+    const tcRe = /<tool_call:[^>]*>tool_call>([^<]*)((?:<arg_key>[\s\S]*?<\/arg_key><arg_value>[\s\S]*?<\/arg_value>)*)<\/tool_call>/g;
+    let t;
+    while ((t = tcRe.exec(m[1])) !== null) {
+      const args = {};
+      const kvRe = /<arg_key>([\s\S]*?)<\/arg_key><arg_value>([\s\S]*?)<\/arg_value>/g;
+      let kv;
+      while ((kv = kvRe.exec(t[2])) !== null) args[kv[1].trim()] = kv[2];
+      tcs.push({ id: 'call_leak_' + tcs.length + '_' + Date.now(), type: 'function', function: { name: t[1].trim(), arguments: JSON.stringify(args) } });
+    }
+    cleaned = cleaned.replace(m[0], '');
+  }
+  if (tcs.length) return { tcs: toOAI(tcs), content: cleaned.replace(/\n{3,}/g, '\n\n').trim() };
+
+  // 风格2: <invoke name="NAME">...<parameter name="K">V</parameter>...</invoke>（anthml 泄露风格）
+  const invRe = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/invoke>/g;
+  while ((m = invRe.exec(content)) !== null) {
+    const args = {};
+    const pRe = /<parameter\s+name="([^"]+)">([\s\S]*?)<\/parameter>/g;
+    let p;
+    while ((p = pRe.exec(m[2])) !== null) args[p[1].trim()] = p[2];
+    tcs.push({ id: 'call_leak_' + tcs.length + '_' + Date.now(), type: 'function', function: { name: m[1], arguments: JSON.stringify(args) } });
+    cleaned = cleaned.replace(m[0], '');
+  }
+  if (tcs.length) return { tcs: toOAI(tcs), content: cleaned.replace(/\n{3,}/g, '\n\n').trim() };
+  return { tcs: null, content };
+}
+
+function toOAI(tcs) {
+  return tcs.map(tc => ({
+    id: tc.id,
     type: 'function',
     function: {
-      name: tc.function && tc.function.name,
-      arguments: typeof (tc.function && tc.function.arguments) === 'string'
-        ? tc.function.arguments
-        : JSON.stringify((tc.function && tc.function.arguments) || {})
+      name: tc.function ? tc.function.name : tc.name,
+      arguments: tc.function ? tc.function.arguments : tc.arguments
     }
   }));
 }
@@ -50,25 +84,27 @@ server.post('/v1/chat/completions', async (req, res) => {
       if (tool_choice !== undefined) params.toolChoice = tool_choice;
     }
 
-    // 带 tools 的请求：SDK 非流式拿完整 tool_calls，再按需包装
     if (hasTools || !stream) {
       const out = await mdl.generateText(params);
       const { msg, finish } = mapRaw(out);
-      const tcs = toOpenAIToolCalls(msg.tool_calls);
-
+      let tcs = toOAIToolCalls(msg.tool_calls);
+      let content = msg.content || out.text || '';
+      if (!tcs.length) {
+        const r = repairLeakedToolCalls(content);
+        if (r.tcs) { tcs = r.tcs; content = r.content; }
+      }
       if (!stream) {
         return res.json({
           id, object: 'chat.completion', created, model,
           choices: [{
             index: 0,
-            message: { role: 'assistant', content: msg.content || out.text || '', ...(tcs.length ? { tool_calls: tcs } : {}) },
+            message: { role: 'assistant', content, ...(tcs.length ? { tool_calls: tcs } : {}) },
             finish_reason: tcs.length ? 'tool_calls' : (finish || 'stop')
           }],
           usage: out.usage || {}
         });
       }
-
-      // stream:true 但带 tools → 结果包装成 SSE 返回
+      // stream:true → SSE 包装（含 tool_calls 场景）
       res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
       const chunk = (delta, fin = null) => 'data: ' + JSON.stringify({
         id, object: 'chat.completion.chunk', created, model,
@@ -78,7 +114,7 @@ server.post('/v1/chat/completions', async (req, res) => {
       if (tcs.length) {
         res.write(chunk({ tool_calls: tcs.map((tc, i) => ({ index: i, id: tc.id, type: 'function', function: tc.function })) }, 'tool_calls'));
       } else {
-        res.write(chunk({ content: msg.content || out.text || '' }));
+        if (content) res.write(chunk({ content }));
         res.write(chunk({}, 'stop'));
       }
       res.write('data: [DONE]\n\n');
