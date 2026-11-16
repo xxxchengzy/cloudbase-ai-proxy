@@ -1,7 +1,12 @@
 const express = require('express');
 const tcb = require('@cloudbase/node-sdk');
 
-const app = tcb.init({ env: process.env.TCB_ENV || tcb.SYMBOL_CURRENT_ENV, timeout: 900000 });
+const app = tcb.init({
+  env: process.env.TCB_ENV || tcb.SYMBOL_CURRENT_ENV,
+  secretId: process.env.TCB_SECRET_ID || undefined,
+  secretKey: process.env.TCB_SECRET_KEY || undefined,
+  timeout: 900000
+});
 const MODELS = ['hy4', 'hy3', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017'];
 
 const server = express();
