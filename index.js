@@ -16,48 +16,76 @@ server.get('/v1/models', (_req, res) => {
   res.json({ object: 'list', data: MODELS.map(m => ({ id: m, object: 'model', owned_by: 'cloudbase' })) });
 });
 
-// 从 SDK rawResponses 提取 OpenAI 结构（含 tool_calls）
-function mapRaw(out, model, id, created) {
-  const raw = out && out.rawResponses && out.rawResponses[out.rawResponses.length - 1] && out.rawResponses[out.rawResponses.length - 1].choices && out.rawResponses[out.rawResponses.length - 1].choices[0];
+function mapRaw(out) {
+  const arr = (out && out.rawResponses) || [];
+  const last = arr[arr.length - 1];
+  const raw = last && last.choices && last.choices[0];
   const msg = (raw && raw.message) || {};
-  const tcs = (msg.tool_calls || []).map((tc, i) => ({
-    id: tc.id || ('call_' + i + '_' + created),
+  return { msg, finish: (raw && raw.finish_reason) || null };
+}
+
+function toOpenAIToolCalls(tcs) {
+  return (tcs || []).map((tc, i) => ({
+    id: tc.id || ('call_' + i + '_' + Date.now()),
     type: 'function',
     function: {
       name: tc.function && tc.function.name,
-      arguments: typeof (tc.function && tc.function.arguments) === 'string' ? tc.function.arguments : JSON.stringify((tc.function && tc.function.arguments) || {})
+      arguments: typeof (tc.function && tc.function.arguments) === 'string'
+        ? tc.function.arguments
+        : JSON.stringify((tc.function && tc.function.arguments) || {})
     }
   }));
-  const choice = {
-    index: 0,
-    message: { role: 'assistant', content: msg.content || out.text || '', ...(tcs.length ? { tool_calls: tcs } : {}) },
-    finish_reason: tcs.length ? 'tool_calls' : ((raw && raw.finish_reason) || 'stop')
-  };
-  return { choice, usage: out.usage || {} };
 }
 
 server.post('/v1/chat/completions', async (req, res) => {
   const { model = 'hy4', messages = [], stream = false, tools, tool_choice } = req.body || {};
   const id = 'chatcmpl-' + Date.now();
   const created = Math.floor(Date.now() / 1000);
+  const hasTools = Array.isArray(tools) && tools.length > 0;
   try {
     const mdl = app.ai().createModel('cloudbase');
     const params = { model, messages };
-    if (Array.isArray(tools) && tools.length) {
-      params.tools = tools; // OpenAI 格式原样透传（SDK 兼容，已实验验证）
+    if (hasTools) {
+      params.tools = tools;
       if (tool_choice !== undefined) params.toolChoice = tool_choice;
     }
 
-    // 带工具时走非流式：需要拿到完整 tool_calls；纯对话才启用真流式
-    if (!stream || (Array.isArray(tools) && tools.length)) {
+    // 带 tools 的请求：SDK 非流式拿完整 tool_calls，再按需包装
+    if (hasTools || !stream) {
       const out = await mdl.generateText(params);
-      const { choice, usage } = mapRaw(out, model, id, created);
-      return res.json({
-        id, object: 'chat.completion', created, model,
-        choices: [choice], usage
-      });
+      const { msg, finish } = mapRaw(out);
+      const tcs = toOpenAIToolCalls(msg.tool_calls);
+
+      if (!stream) {
+        return res.json({
+          id, object: 'chat.completion', created, model,
+          choices: [{
+            index: 0,
+            message: { role: 'assistant', content: msg.content || out.text || '', ...(tcs.length ? { tool_calls: tcs } : {}) },
+            finish_reason: tcs.length ? 'tool_calls' : (finish || 'stop')
+          }],
+          usage: out.usage || {}
+        });
+      }
+
+      // stream:true 但带 tools → 结果包装成 SSE 返回
+      res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+      const chunk = (delta, fin = null) => 'data: ' + JSON.stringify({
+        id, object: 'chat.completion.chunk', created, model,
+        choices: [{ index: 0, delta, finish_reason: fin }]
+      }) + '\n\n';
+      res.write(chunk({ role: 'assistant' }));
+      if (tcs.length) {
+        res.write(chunk({ tool_calls: tcs.map((tc, i) => ({ index: i, id: tc.id, type: 'function', function: tc.function })) }, 'tool_calls'));
+      } else {
+        res.write(chunk({ content: msg.content || out.text || '' }));
+        res.write(chunk({}, 'stop'));
+      }
+      res.write('data: [DONE]\n\n');
+      return res.end();
     }
 
+    // 纯对话真流式
     const sres = await mdl.streamText(params);
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
     const chunk = (delta, fin = null) => 'data: ' + JSON.stringify({
