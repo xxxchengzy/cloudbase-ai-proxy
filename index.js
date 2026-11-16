@@ -68,4 +68,9 @@ server.post('/v1/images/generations', async (req, res) => {
   }
 });
 
+server.get('/v1/debug', (_req, res) => {
+  const keys = Object.keys(process.env).filter(k => /TCB|SECRET|ENV|PORT/i.test(k)).sort();
+  res.json({ keys, hasSecretId: !!process.env.TCB_SECRET_ID, hasSecretKey: !!process.env.TCB_SECRET_KEY, envName: process.env.TCB_ENV || null });
+});
+
 server.listen(process.env.PORT || 80, '0.0.0.0');
