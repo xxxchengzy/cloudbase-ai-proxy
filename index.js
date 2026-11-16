@@ -7,7 +7,7 @@ const app = tcb.init({
   secretKey: process.env.TCB_SECRET_KEY || undefined,
   timeout: 900000
 });
-const VERSION = 'fix-3f582e0';
+const VERSION = 'leak-guard-1';
 const MODELS = ['hy4', 'hy3', 'deepseek-v4.1-flash', 'deepseek-v4.1-flash-1017'];
 
 const server = express();
@@ -25,13 +25,25 @@ function mapRaw(out) {
   return { msg, finish: (raw && raw.finish_reason) || null };
 }
 
-// 修复层：解析模型泄露在正文里的工具调用标记（混元/GLM arg_key 风格、通用 invoke 风格）
+function toOAI(tcs) {
+  return (tcs || []).map((tc, i) => ({
+    id: tc.id || ('call_' + i + '_' + Date.now()),
+    type: 'function',
+    function: {
+      name: (tc.function && tc.function.name) || tc.name,
+      arguments: tc.function
+        ? (typeof tc.function.arguments === 'string' ? tc.function.arguments : JSON.stringify(tc.function.arguments || {}))
+        : (typeof tc.arguments === 'string' ? tc.arguments : JSON.stringify(tc.arguments || {}))
+    }
+  }));
+}
+
+// 修复层：解析泄露在正文里的工具调用标记
 function repairLeakedToolCalls(content) {
   if (!content || typeof content !== 'string' || content.indexOf('<') === -1) return { tcs: null, content };
   const tcs = [];
   let cleaned = content;
   let m;
-  // 风格1: <tool_calls:ID><tool_call:ID>tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>...</tool_call></tool_calls>
   const blockRe = /<tool_calls:[^>]*>([\s\S]*?)<\/tool_calls>/g;
   while ((m = blockRe.exec(content)) !== null) {
     const tcRe = /<tool_call:[^>]*>tool_call>([^<]*)((?:<arg_key>[\s\S]*?<\/arg_key><arg_value>[\s\S]*?<\/arg_value>)*)<\/tool_call>/g;
@@ -47,7 +59,6 @@ function repairLeakedToolCalls(content) {
   }
   if (tcs.length) return { tcs: toOAI(tcs), content: cleaned.replace(/\n{3,}/g, '\n\n').trim() };
 
-  // 风格2: <invoke name="NAME">...<parameter name="K">V</parameter>...</invoke>（anthml 泄露风格）
   const invRe = /<invoke\s+name="([^"]+)">([\s\S]*?)<\/invoke>/g;
   while ((m = invRe.exec(content)) !== null) {
     const args = {};
@@ -61,16 +72,16 @@ function repairLeakedToolCalls(content) {
   return { tcs: null, content };
 }
 
-function toOAI(tcs) {
-  return tcs.map(tc => ({
-    id: tc.id,
-    type: 'function',
-    function: {
-      name: tc.function ? tc.function.name : tc.name,
-      arguments: tc.function ? tc.function.arguments : tc.arguments
-    }
-  }));
+// 泄露起始检测：buf 尾部是否悬着可能演变成标记的 "<tool..."
+function holdbackLen(buf) {
+  const target = '<tool_calls:';
+  const max = Math.min(buf.length, target.length);
+  for (let len = max; len >= 1; len--) {
+    if (target.startsWith(buf.slice(buf.length - len))) return len;
+  }
+  return 0;
 }
+const LEAK_MID = /<tool_(calls?|call)[^>]*>?/;
 
 server.post('/v1/chat/completions', async (req, res) => {
   const { model = 'hy4', messages = [], stream = false, tools, tool_choice } = req.body || {};
@@ -105,7 +116,6 @@ server.post('/v1/chat/completions', async (req, res) => {
           usage: out.usage || {}
         });
       }
-      // stream:true → SSE 包装（含 tool_calls 场景）
       res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
       const chunk = (delta, fin = null) => 'data: ' + JSON.stringify({
         id, object: 'chat.completion.chunk', created, model,
@@ -122,7 +132,7 @@ server.post('/v1/chat/completions', async (req, res) => {
       return res.end();
     }
 
-    // 纯对话真流式
+    // 纯对话真流式 + 泄露护栏
     const sres = await mdl.streamText(params);
     res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
     const chunk = (delta, fin = null) => 'data: ' + JSON.stringify({
@@ -130,11 +140,45 @@ server.post('/v1/chat/completions', async (req, res) => {
       choices: [{ index: 0, delta, finish_reason: fin }]
     }) + '\n\n';
     res.write(chunk({ role: 'assistant' }));
+    let buf = '';
+    let sentLen = 0;
+    let leakMode = false;
     for await (const data of sres.dataStream) {
       const delta = data?.choices?.[0]?.delta?.content ?? data?.choices?.[0]?.message?.content ?? '';
-      if (delta) res.write(chunk({ content: delta }));
+      if (!delta) continue;
+      buf += delta;
+      if (leakMode) continue; // 泄露模式：只攒不发
+      const idx = buf.search(LEAK_MID);
+      if (idx >= 0) {
+        const safePart = buf.slice(sentLen, idx);
+        if (safePart) res.write(chunk({ content: safePart }));
+        sentLen = idx;
+        leakMode = true;
+        continue;
+      }
+      const hold = holdbackLen(buf);
+      const safeEnd = buf.length - hold;
+      if (safeEnd > sentLen) {
+        res.write(chunk({ content: buf.slice(sentLen, safeEnd) }));
+        sentLen = safeEnd;
+      }
     }
-    res.write(chunk({}, 'stop'));
+    if (leakMode) {
+      const r = repairLeakedToolCalls(buf);
+      if (r.tcs && r.tcs.length) {
+        res.write(chunk({ tool_calls: r.tcs.map((tc, i) => ({ index: i, id: tc.id, type: 'function', function: tc.function })) }, 'tool_calls'));
+        if (r.content) res.write(chunk({ content: r.content }));
+        res.write(chunk({}, 'tool_calls'));
+      } else {
+        const rest = buf.slice(sentLen);
+        if (rest) res.write(chunk({ content: rest }));
+        res.write(chunk({}, 'stop'));
+      }
+    } else {
+      const rest = buf.slice(sentLen);
+      if (rest) res.write(chunk({ content: rest }));
+      res.write(chunk({}, 'stop'));
+    }
     res.write('data: [DONE]\n\n');
     return res.end();
   } catch (e) {
