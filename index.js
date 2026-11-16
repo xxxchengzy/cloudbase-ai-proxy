@@ -22,7 +22,6 @@ server.post('/v1/chat/completions', async (req, res) => {
   const created = Math.floor(Date.now() / 1000);
   try {
     const mdl = app.ai().createModel('cloudbase');
-
     if (stream) {
       const sres = await mdl.streamText({ model, messages });
       res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
@@ -35,13 +34,10 @@ server.post('/v1/chat/completions', async (req, res) => {
         const delta = data?.choices?.[0]?.delta?.content ?? data?.choices?.[0]?.message?.content ?? '';
         if (delta) res.write(chunk({ content: delta }));
       }
-      let usage = {};
-      try { usage = await sres.usage; } catch {}
       res.write(chunk({}, 'stop'));
       res.write('data: [DONE]\n\n');
       return res.end();
     }
-
     const out = await mdl.generateText({ model, messages });
     return res.json({
       id, object: 'chat.completion', created, model,
@@ -66,8 +62,6 @@ server.post('/v1/images/generations', async (req, res) => {
   } catch (e) {
     return res.status(500).json({ error: { message: String(e && e.message || e) } });
   }
-});
-
 });
 
 server.listen(process.env.PORT || 80, '0.0.0.0');
