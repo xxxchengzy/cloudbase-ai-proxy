@@ -63,4 +63,4 @@ server.post('/v1/images/generations', async (req, res) => {
   }
 });
 
-server.listen(process.env.PORT || 9000, '0.0.0.0');
+server.listen(process.env.PORT || 80, '0.0.0.0');
